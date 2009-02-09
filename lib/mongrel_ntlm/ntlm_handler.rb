@@ -98,8 +98,8 @@ end
 class NtlmHandler < Mongrel::HttpHandler
   def process(request, response)
     # clear headers of data that we did not set
-    request.params.delete('REMOTE_USER')
-    request.params.delete('HTTP_X_MONGREL_PID')
+    request.params.delete(Mongrel::Const::REMOTE_USER)
+    request.params.delete(Mongrel::Const::HTTP_X_MONGREL_PID)
 
     # add NTLM capabilities to the request and response
     request.extend(Mongrel::NtlmHttpRequest)
