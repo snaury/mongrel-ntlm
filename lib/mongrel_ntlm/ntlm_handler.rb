@@ -9,10 +9,10 @@ require 'mongrel_ntlm/server_ntlm'
 # but the NTLM handshake involves three legs on a persistent connection
 module Mongrel
   module Const
-    NTLM_STATUS_FORMAT = "HTTP/1.1 %d %s\r\n".freeze
     REMOTE_USER = 'REMOTE_USER'.freeze
     HTTP_AUTHORIZATION = 'HTTP_AUTHORIZATION'.freeze
     HTTP_X_MONGREL_PID = 'HTTP_X_MONGREL_PID'.freeze
+    NTLM_STATUS_FORMAT = "HTTP/1.1 %d %s\r\n".freeze
   end
 
   # Custom methods for supporting NTLM authentication requests
@@ -28,40 +28,42 @@ module Mongrel
     def ntlm_refresh
       parser = HttpParser.new
       new_params = HttpParams.new
-      new_request = nil
-      data = @socket.readpartial(Const::CHUNK_SIZE)
+      new_data = @socket.readpartial(Const::CHUNK_SIZE)
       nparsed = 0
 
-      while nparsed < data.length
-        nparsed = parser.execute(params, data, nparsed)
+      @body.close
+      while nparsed < new_data.length
+        nparsed = parser.execute(new_params, new_data, nparsed)
         if parser.finished?
           new_params[Const::REQUEST_PATH] ||= @params[Const::REQUEST_PATH]
           raise "No REQUEST PATH" unless new_params[Const::REQUEST_PATH]
-          
+          raise "REQUEST URI mismatch" unless new_params[Const::REQUEST_URI] == @params[Const::REQUEST_URI]
+          raise "REQUEST PATH mismatch" unless new_params[Const::REQUEST_PATH] == @params[Const::REQUEST_PATH]
+
           new_params[Const::PATH_INFO] = @params[Const::PATH_INFO]
           new_params[Const::SCRIPT_NAME] = @params[Const::SCRIPT_NAME]
           new_params[Const::REMOTE_ADDR] = @params[Const::REMOTE_ADDR]
-          
-          new_request = HttpRequest.new(params, @socket, [])
+
+          # We need to reinitialize with same @dispatchers, because browser might
+          # start uploading data and we want to allow watching its progress
+          initialize(new_params, @socket, @dispatchers)
           break
         else
           # Parser is not done, queue up more data to read and continue parsing
           chunk = @socket.readpartial(Const::CHUNK_SIZE)
           break if !chunk or chunk.length == 0  # read failed, stop processing
 
-          data << chunk
-          if data.length >= Const::MAX_HEADER
+          new_data << chunk
+          if new_data.length >= Const::MAX_HEADER
             raise HttpParserError.new("HEADER is longer than allowed, aborting client early.")
           end
         end
       end
-      
-      @params = params
-      @body.close
-      @body = new_request.body
     rescue HttpParserError => e
-      STDERR.puts "#{Time.now}: HTTP parse error, malformed request (#{params[Const::HTTP_X_FORWARDED_FOR] || client.peeraddr.last}): #{e.inspect}"
-      STDERR.puts "#{Time.now}: REQUEST DATA: #{data.inspect}\n---\nPARAMS: #{params.inspect}\n---\n"
+      # We use new_params and new_data here, HttpServer#process_client won't display it for us :(
+      STDERR.puts "#{Time.now}: HTTP parse error, malformed request (#{new_params[Const::HTTP_X_FORWARDED_FOR] || @socket.peeraddr.last}): #{e.inspect}"
+      STDERR.puts "#{Time.now}: REQUEST DATA: #{new_data.inspect}\n---\nPARAMS: #{new_params.inspect}\n---\n"
+      raise # request will be cancelled in ntlm handler
     end
   end
 
@@ -75,7 +77,7 @@ module Mongrel
       end
     end
 
-    def ntlm_finished
+    def ntlm_send
       send_ntlm_status
       send_header
     end
@@ -98,57 +100,56 @@ class NtlmHandler < Mongrel::HttpHandler
     # clear headers of data that we did not set
     request.params.delete('REMOTE_USER')
     request.params.delete('HTTP_X_MONGREL_PID')
-    
+
     # add NTLM capabilities to the request and response
     request.extend(Mongrel::NtlmHttpRequest)
     response.extend(Mongrel::NtlmHttpResponse)
-    
-    return process_no_auth(request, response) if request.ntlm_token.nil?
-    
+
+    return request_auth(response) if request.ntlm_token.nil?
+
     ntlm = Win32::SSPI::ServerNtlm.new
     ntlm.acquire_credentials_handle
-    
+
     process_type1_auth(ntlm, request, response)
     request.ntlm_refresh
-    response.ntlm_reset
-    
     process_type3_auth(ntlm, request, response)
-    
+
     request.params[Mongrel::Const::REMOTE_USER] = ntlm.get_username_from_context
     request.params[Mongrel::Const::HTTP_X_MONGREL_PID] = Process.pid.to_s
+  rescue HttpParserError => e
+    # The correct error was already displayed
+    # Make sure it's not processed any further
+    response.done = true
   rescue
     STDERR.puts "#{Time.now}: NTLM authentication error: #{$!.inspect}"
-    response.ntlm_reset
+    # Don't leak response to any other handler
+    response.done = true
   ensure
     ntlm.cleanup unless ntlm.nil?
   end
 
   protected
-  # No NTLM header sent, ask for one and close the connection.
-  def process_no_auth(request, response)
-    response.start(401, true) do |head,out|
-      head['WWW-Authenticate'] = 'NTLM'
+
+  # Sends authorization request back to browser
+  def request_auth(response, auth = 'NTLM', finished = true)
+    response.start(401, finished) do |gead,out|
+      head['WWW-Authenticate'] = auth
     end
   end
-  
+
   # First leg of NTLM authentication is to process the Type 1 NTLM Message from the client.
   def process_type1_auth(ntlm, request, response)
     t1 = request.ntlm_token
     t2 = ntlm.accept_security_context(t1)
-
-    response.start(401) do |head,out|
-      head['WWW-Authenticate'] = "NTLM #{t2}"
-    end
-    
-    response.ntlm_finished
+    request_auth(response, "NTLM #{t2}", false)
+    response.ntlm_send
+    response.ntlm_reset
   end
-  
+
   # Third leg of NTLM authentication is to process the Type 3 NTLM Message from the client.
   def process_type3_auth(ntlm, request, response)
     t3 = request.ntlm_token
     t2 = ntlm.accept_security_context(t3)
-    
-    # try to give rails as pristine a response object as possible
     response.ntlm_reset
   end
 end
