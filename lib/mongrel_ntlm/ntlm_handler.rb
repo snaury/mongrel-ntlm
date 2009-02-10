@@ -110,6 +110,22 @@ end
 #
 # Passes through to the regular login page if anything goes wrong.
 class NtlmHandler < Mongrel::HttpHandler
+  AUTHORIZATION_MESSAGE = <<END
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+<html><head>
+<title>401 NTLM Authorization Required</title>
+</head><body>
+<h1>NTLM Authorization Required</h1>
+<p>This server could not verify that you
+are authorized to access the document
+requested.  Either you supplied the wrong
+credentials (e.g., bad password), or your
+browser doesn't understand how to supply
+the credentials required.</p>
+<hr>
+</body></html>
+END
+
   def process(request, response)
     # clear headers of data that we did not set
     request.params.delete(Mongrel::Const::REMOTE_USER)
@@ -155,6 +171,8 @@ class NtlmHandler < Mongrel::HttpHandler
     return if response.done || response.socket.closed?
     response.start(401, finished) do |head,out|
       head['WWW-Authenticate'] = auth if auth
+      head['Content-Type'] = 'text/html; charset=iso-8859-1'
+      out.write(AUTHORIZATION_MESSAGE)
     end
   end
 
