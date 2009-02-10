@@ -10,20 +10,35 @@ require 'mongrel_ntlm/server_ntlm'
 module Mongrel
   module Const
     REMOTE_USER = 'REMOTE_USER'.freeze
+    HTTP_VERSION = 'HTTP_VERSION'.freeze
+    HTTP_CONNECTION = 'HTTP_CONNECTION'.freeze
     HTTP_AUTHORIZATION = 'HTTP_AUTHORIZATION'.freeze
     HTTP_X_MONGREL_PID = 'HTTP_X_MONGREL_PID'.freeze
-    NTLM_STATUS_FORMAT = "HTTP/1.1 %d %s\r\n".freeze
+    NTLM_STATUS_FORMAT = "HTTP/1.1 %d %s\r\nConnection: Keep-Alive\r\n".freeze
+  end
+
+  class NtlmRequestError < IOError
+    # Dummy IOError to stop authentication
   end
 
   # Custom methods for supporting NTLM authentication requests
   module NtlmHttpRequest
+    def ntlm_keepalive
+      httpversion = (params[Const::HTTP_VERSION] || '').strip.upcase
+      connection = (params[Const::HTTP_CONNECTION] || '').strip.downcase
+      keepalive = httpversion == 'HTTP/1.0' ? false : true
+      keepalive = false if connection == 'close'
+      keepalive = true if connection == 'keep-alive'
+      keepalive
+    end
+
     def ntlm_token
       auth = params[Const::HTTP_AUTHORIZATION]
       return nil unless auth && auth.match(/\ANTLM (.*)\Z/)
       Base64.decode64($1.strip)
     end
 
-    # Create a new HttpRequest object from the same socket and steal its body.
+    # Reinitialize HttpRequest object from the same socket
     # Mostly just the main loop of mongrel.
     def ntlm_refresh
       parser = HttpParser.new
@@ -51,7 +66,9 @@ module Mongrel
         else
           # Parser is not done, queue up more data to read and continue parsing
           chunk = @socket.readpartial(Const::CHUNK_SIZE)
-          break if !chunk or chunk.length == 0  # read failed, stop processing
+          if !chunk or chunk.length == 0
+            raise NtlmRequestError # read failed, stop processing
+          end
 
           new_data << chunk
           if new_data.length >= Const::MAX_HEADER
@@ -63,7 +80,7 @@ module Mongrel
       # We use new_params and new_data here, HttpServer#process_client won't display it for us :(
       STDERR.puts "#{Time.now}: HTTP parse error, malformed request (#{new_params[Const::HTTP_X_FORWARDED_FOR] || @socket.peeraddr.last}): #{e.inspect}"
       STDERR.puts "#{Time.now}: REQUEST DATA: #{new_data.inspect}\n---\nPARAMS: #{new_params.inspect}\n---\n"
-      raise # request will be cancelled in ntlm handler
+      raise NtlmRequestError
     end
   end
 
@@ -83,10 +100,7 @@ module Mongrel
     end
 
     def ntlm_reset
-      @header.out.truncate(0)
-      @body.close
-      @body = StringIO.new
-      @status_sent = @header_sent = @body_sent = false
+      initialize(@socket)
     end
   end
 end
@@ -105,25 +119,30 @@ class NtlmHandler < Mongrel::HttpHandler
     request.extend(Mongrel::NtlmHttpRequest)
     response.extend(Mongrel::NtlmHttpResponse)
 
-    return request_auth(response) if request.ntlm_token.nil?
+    return request_auth(response, 'NTLM') if request.ntlm_token.nil?
+    return request_auth(response) unless request.ntlm_keepalive # we need persistent connections
 
     ntlm = Win32::SSPI::ServerNtlm.new
     ntlm.acquire_credentials_handle
 
     process_type1_auth(ntlm, request, response)
+
     request.ntlm_refresh
+    return request_auth(response) if request.ntlm_token.nil?
+
     process_type3_auth(ntlm, request, response)
 
     request.params[Mongrel::Const::REMOTE_USER] = ntlm.get_username_from_context
     request.params[Mongrel::Const::HTTP_X_MONGREL_PID] = Process.pid.to_s
-  rescue HttpParserError => e
-    # The correct error was already displayed
-    # Make sure it's not processed any further
+  rescue IOError => e
+    # There is not much we can do in case of IOError, besides
+    # it usually means browser did something bad and we don't
+    # have to care.
+    # Make sure this request is not processed though
     response.done = true
   rescue
     STDERR.puts "#{Time.now}: NTLM authentication error: #{$!.inspect}"
-    # Don't leak response to any other handler
-    response.done = true
+    request_auth(response) # error or not, we do require authentication
   ensure
     ntlm.cleanup unless ntlm.nil?
   end
@@ -131,9 +150,11 @@ class NtlmHandler < Mongrel::HttpHandler
   protected
 
   # Sends authorization request back to browser
-  def request_auth(response, auth = 'NTLM', finished = true)
-    response.start(401, finished) do |gead,out|
-      head['WWW-Authenticate'] = auth
+  def request_auth(response, auth = nil, finished = true)
+    # make sure we don't produce IOError and don't stomp on another response
+    return if response.done || response.socket.closed?
+    response.start(401, finished) do |head,out|
+      head['WWW-Authenticate'] = auth if auth
     end
   end
 
