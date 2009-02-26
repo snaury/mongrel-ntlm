@@ -97,6 +97,7 @@ module Mongrel
     def ntlm_send
       send_ntlm_status
       send_header
+      send_body
     end
 
     def ntlm_reset
